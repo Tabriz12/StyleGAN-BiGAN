@@ -1,0 +1,1 @@
+python train.py --outdir=../datasets/cifar10/training-runs/ --gpus=1 --data=../datasets/cifar10/custom/

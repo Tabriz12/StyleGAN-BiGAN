@@ -15,6 +15,10 @@ import dnnlib
 import dnnlib.tflib as tflib
 from dnnlib.tflib.ops.upfirdn_2d import upsample_2d, downsample_2d, upsample_conv_2d, conv_downsample_2d
 from dnnlib.tflib.ops.fused_bias_act import fused_bias_act
+tf.keras.backend.set_image_data_format("channels_first")
+from tensorflow import keras
+from tensorflow.keras.layers import Conv2D, BatchNormalization, Dropout, Activation, AveragePooling2D, Flatten
+
 
 # NOTE: Do not import any application-specific modules here!
 # Specify all network parameters as kwargs.
@@ -192,7 +196,7 @@ def G_main(
     # Evaluation mode.
     is_training             = False,                # Network is under training? Enables and disables specific features.
     is_validation           = False,                # Network is under validation? Chooses which value to use for truncation_psi.
-    return_dlatents         = False,                # Return dlatents (W) in addition to the images?
+    return_dlatents         = False,             # I NEED THIS ONE   # Return dlatents (W) in addition to the images?
 
     # Truncation & style mixing.
     truncation_psi          = 0.5,                  # Style strength multiplier for the truncation trick. None = disable.
@@ -227,11 +231,12 @@ def G_main(
 
     # Setup components.
     # NETWORK SETUP DONE HERE
+
     if 'synthesis' not in components:
         components.synthesis = tflib.Network('G_synthesis', func_name=globals()[synthesis_func], **kwargs)
     num_layers = components.synthesis.input_shape[1]
     dlatent_size = components.synthesis.input_shape[2]
-    if 'mapping' not in components:
+    if 'mapping' not in components:  # TAKES FUNC_NAME AS INPUT TO INITIALIZE THE NETWORK
         components.mapping = tflib.Network('G_mapping', func_name=globals()[mapping_func], dlatent_broadcast=num_layers, **kwargs)
 
     # Evaluate mapping network.
@@ -452,14 +457,124 @@ def G_synthesis(
 
     images_out = y
     assert images_out.dtype == tf.as_dtype(dtype)
-    return tf.identity(images_out, name='images_out')
+    return tf.identity(images_out, name='images_out')  # Calling tf.identity on a variable will make a Tensor that
+                                                      # represents the value of that variable at the time it is called.
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Encoder.
+
+def Encoder(
+        images_in,
+        labels_in,
+        label_size=0,
+        resolution = 32,
+        num_channels = 3,
+        dtype = 'float32',
+        architecture = 'resnet',
+        **_kwargs
+
+):
+
+    resolution_log2 = int(np.log2(resolution))
+    assert resolution == 2**resolution_log2 and resolution >= 4
+    # Inputs
+    print(images_in)
+    images_in.set_shape([None, num_channels, resolution, resolution])
+    labels_in.set_shape([None, label_size])
+    images_in = tf.cast(images_in, dtype)
+    labels_in = tf.cast(labels_in, dtype)
+
+    def residual_block(X, num_filters: int, activation: str='relu', kernel_size: int = 3,
+                       stride: int = 1, bn: bool=True, conv_first: bool = True):
+
+        conv_layer = Conv2D(num_filters,
+                            kernel_size=kernel_size,
+                            strides=stride,
+                            padding='same',
+                            kernel_regularizer=keras.regularizers.l2(1e-4)
+                            )
+        if conv_first:
+            X = conv_layer(X)
+            if bn:
+                X = BatchNormalization()(X)
+            if activation is not None:
+                X = Activation(activation)(X)
+                X = Dropout(0.2)(X)
+        else:
+            if bn:
+                X = BatchNormalization()(X)
+            if activation is not None:
+                X = Activation(activation)(X)
+            X = conv_layer(X)
+
+        return X
+
+    depth = 56
+    num_filters_in = 32
+    num_res_block = int((depth - 2) / 9)
+
+    # ResNet V2 performs Conv2D on X before spiting into two path
+    X = residual_block(X=images_in, num_filters=num_filters_in, conv_first=True)
+
+    # Building stack of residual units
+    for stage in range(3):
+        for unit_res_block in range(num_res_block):
+            activation = 'relu'
+            bn = True
+            stride = 1
+            # First layer and first stage
+            if stage == 0:
+                num_filters_out = num_filters_in * 4
+                if unit_res_block == 0:
+                    activation = None
+                    bn = False
+                # First layer but not first stage
+            else:
+                num_filters_out = num_filters_in * 2
+                if unit_res_block == 0:
+                    stride = 2
+
+            # bottleneck residual unit
+            y = residual_block(X,
+                               num_filters=num_filters_in,
+                               kernel_size=1,
+                               stride=stride,
+                               activation=activation,
+                               bn=bn,
+                               conv_first=False)
+            y = residual_block(y,
+                               num_filters=num_filters_in,
+                               conv_first=False)
+            y = residual_block(y,
+                               num_filters=num_filters_out,
+                               kernel_size=1,
+                               conv_first=False)
+            if unit_res_block == 0:
+                # linear projection residual shortcut connection to match
+                # changed dims
+                X = residual_block(X=X,
+                                   num_filters=num_filters_out,
+                                   kernel_size=1,
+                                   stride=stride,
+                                   activation=None,
+                                   bn=False)
+            X = tf.keras.layers.add([X, y])
+        num_filters_in = num_filters_out
+
+    X = BatchNormalization()(X)
+    X = Activation('relu')(X)
+    X = AveragePooling2D(pool_size=8)(X)
+    y = Flatten()(X)
+
+    return y
+
+# ----------------------------------------------------------------------------
 # Discriminator.
 
 def D_main(
-    images_in,                          # First input: Images [minibatch, channel, height, width].
-    labels_in,                          # Second input: Conditioning labels [minibatch, label_size].
+    images_in,                          # First input: Images [ minibatch, channel, height, width].
+    labels_in,                          # Second input: Conditioning labels [ minibatch, label_size].
 
     # Input dimensions.
     num_channels        = 3,            # Number of input color channels. Overridden based on dataset.
@@ -498,6 +613,7 @@ def D_main(
 
     **_kwargs,                          # Ignore unrecognized keyword args.
 ):
+
     resolution_log2 = int(np.log2(resolution))
     assert resolution == 2**resolution_log2 and resolution >= 4
     def nf(stage): return np.clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max)
@@ -587,6 +703,9 @@ def D_main(
             return downsample_2d(y, k=resample_kernel)
 
     # Layers for >=8x8 resolutions.
+    # From resolution 2^resolution_log2 * 2^resolution_log2 till 8x8
+    # The discriminator layer size decreases by factor of 2
+    # Then what is the network architecture of resnet?
     x = None
     y = images_in
     for res in range(resolution_log2, 2, -1):
