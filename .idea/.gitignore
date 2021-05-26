@@ -1,6 +1,7 @@
 # Default ignored files
 /shelf/
 /workspace.xml
+../run_script.sh
 /datasets/
 # Datasource local storage ignored files
 /../../../../../../:\Users\Tabriz\IdeaProjects\stylegan2-ada-main\.idea/dataSources/
