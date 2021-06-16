@@ -26,13 +26,15 @@ def report_stat(aug, name, value):
 #----------------------------------------------------------------------------
 # Report loss terms and collect them into EasyDict.
 
-def report_loss(aug, G_loss, D_loss, G_reg=None, D_reg=None):
-    assert G_loss is not None and D_loss is not None
+
+def report_loss(aug, G_E_loss, D_loss, G_reg=None, D_reg=None, E_reg=None):
+    assert G_E_loss is not None and D_loss is not None
     terms = dnnlib.EasyDict(G_reg=None, D_reg=None)
-    terms.G_loss = report_stat(aug, 'Loss/G/loss', G_loss)
+    terms.G_E_loss = report_stat(aug, 'Loss/G/loss', G_E_loss)
     terms.D_loss = report_stat(aug, 'Loss/D/loss', D_loss)
     if G_reg is not None: terms.G_reg = report_stat(aug, 'Loss/G/reg', G_reg)
     if D_reg is not None: terms.D_reg = report_stat(aug, 'Loss/D/reg', D_reg)
+    if E_reg is not None: terms.E_reg = report_stat(aug, 'Loss/E/reg', E_reg)
     return terms
 
 #----------------------------------------------------------------------------
@@ -51,6 +53,18 @@ def eval_G(G, latents, labels, return_dlatents=False):
         r.images, r.dlatents = r.images
     return r
 
+
+def eval_E(E, images, labels, return_images=True):
+    r = dnnlib.EasyDict()
+    r.args = dnnlib.EasyDict()
+    r.args.is_training = True
+    if return_images:
+        r.args.return_images = True
+    r.dlatents = E.get_output_for(images, labels, **r.args)
+    r.images = None
+    if return_images:
+        r.dlatents, r.images = r.dlatents
+    return r
 #----------------------------------------------------------------------------
 # Evaluate D and return results as EasyDict.
 
@@ -69,24 +83,147 @@ def eval_D(D, aug, images, labels, report=None, augment_inputs=True, return_aux=
         r.args.score_size = return_aux + 1
     r.scores = D.get_output_for(r.images_aug, r.labels_aug, **r.args)
 
+    r.output_1, r.output_2 = r.scores
+
     r.aux = None
-    if return_aux:
+    if return_aux: # Tabriz: Probably, it is about data augmentation
         r.aux = r.scores[:, 1:]
         r.scores = r.scores[:, :1]
 
     if report is not None:
         report_ops = [
-            report_stat(aug, 'Loss/scores/' + report, r.scores),
-            report_stat(aug, 'Loss/signs/' + report, tf.sign(r.scores)),
-            report_stat(aug, 'Loss/squares/' + report, tf.square(r.scores)),
+            report_stat(aug, 'Loss/scores/' + report, r.output_2),
+            report_stat(aug, 'Loss/signs/' + report, tf.sign(r.output_2)),
+            report_stat(aug, 'Loss/squares/' + report, tf.square(r.output_2)),
         ]
         with tf.control_dependencies(report_ops):
-            r.scores = tf.identity(r.scores)
+            r.output_2 = tf.identity(r.output_2)
     return r
+
+
+def eval_D_H(
+        D_H,
+        latents,
+        labels,
+):
+    r = dnnlib.EasyDict()
+    print("D_H:", type(latents))
+    r.args = dnnlib.EasyDict()
+    r.args.is_training = True
+    r.output_1, r.output_2 = D_H.get_output_for(latents, labels, **r.args)
+    return r
+
+
+def eval_D_J(
+        D_J,
+        input_f,
+        input_h
+):
+    r = dnnlib.EasyDict()
+    print("D_J:", type(input_f))
+    r.args = dnnlib.EasyDict()
+    r.args.is_training = True
+    r.score = D_J.get_output_for(input_f, input_h, **r.args)
+    return r
+
+def disc_loss(real_f_output, real_h_output, real_j_output, fake_f_output, fake_h_output, fake_j_output):
+
+    real_loss = tf.reduce_mean(tf.nn.relu(tf.ones_like(real_f_output) - real_f_output)
+                               + tf.nn.relu(tf.ones_like(real_h_output) - real_h_output)
+                               + tf.nn.relu(tf.ones_like(real_j_output) - real_j_output))
+    fake_loss = tf.reduce_mean(tf.nn.relu(tf.ones_like(fake_f_output) + fake_f_output)
+                               + tf.nn.relu(tf.ones_like(fake_h_output) + fake_h_output)
+                               + tf.nn.relu(tf.ones_like(fake_j_output) + fake_j_output))
+    total_loss = real_loss + fake_loss
+    return total_loss
+
+def gen_en_loss(real_f_output, real_h_output, real_j_output, fake_f_output, fake_h_output, fake_j_output):
+
+    real_loss = tf.reduce_mean(tf.reduce_sum([real_f_output, real_h_output, real_j_output], axis=0))
+    fake_loss = tf.reduce_mean((-1) * tf.reduce_sum([fake_f_output, fake_h_output, fake_j_output], axis=0))
+
+    return real_loss + fake_loss
 
 #----------------------------------------------------------------------------
 # Non-saturating logistic loss with R1 and path length regularizers, used
 # in the paper "Analyzing and Improving the Image Quality of StyleGAN".
+
+def bistylegan (G, D, E, D_H, D_J, aug, fake_labels, real_images, real_labels,
+                r1_gamma = 10, pl_minibatch_shrink=2, pl_decay=0.01, pl_weight=2, **_kwargs):
+    minibatch_size = tf.shape(fake_labels)[0]
+    fake_latents = tf.random_normal([minibatch_size] + G.input_shapes[0][1:])
+    G_fake = eval_G(G, fake_latents, fake_labels, return_dlatents=True)
+    E_real = eval_E(E, real_images, real_labels)
+    D_fake = eval_D(D, aug, G_fake.images, fake_labels, report='fake')
+    D_real = eval_D(D, aug, real_images, real_labels, report='real')
+    D_H_fake = eval_D_H(D_H, fake_latents, fake_labels) # Tabriz: should I use first or second vector in G?
+    D_H_real = eval_D_H(D_H, E_real.dlatents, real_labels)
+    D_J_fake = eval_D_J(D_J, D_fake.output_1, D_H_fake.output_1)
+    D_J_real = eval_D_J(D_J, D_real.output_1, D_H_real.output_1)
+
+    with tf.name_scope('Loss_main'):
+        D_loss = disc_loss(D_real.output_2, D_H_real.output_2, D_J_real.score,
+                           D_fake.output_2, D_H_fake.output_2, D_J_fake.score)
+
+        G_E_loss  = gen_en_loss(D_real.output_2, D_H_real.output_2, D_J_real.score,
+                                D_fake.output_2, D_H_fake.output_2, D_J_fake.score)
+        G_reg = 0
+        D_reg = 0
+        E_reg = 0
+
+    # R1 regularizer from "Which Training Methods for GANs do actually Converge?".
+    # https://ai.stackexchange.com/questions/25458/can-someone-explain-r1-regularization-function-in-simple-terms
+
+    if r1_gamma != 0:
+        with tf.name_scope('Loss_R1'):
+            r1_grads = tf.gradients(tf.reduce_sum(D_real.output_2), [real_images])[0]
+            r1_penalty = tf.reduce_sum(tf.square(r1_grads), axis=[1,2,3])
+            r1_penalty = report_stat(aug, 'Loss/r1_penalty', r1_penalty)
+            D_reg += r1_penalty * (r1_gamma * 0.5)
+
+    if pl_weight != 0:
+        with tf.name_scope('Loss_PL'):
+
+            # Evaluate the regularization term using a smaller minibatch to conserve memory.
+            G_pl = G_fake
+            if pl_minibatch_shrink > 1:
+                pl_minibatch_size = minibatch_size // pl_minibatch_shrink
+                pl_latents = fake_latents[:pl_minibatch_size]
+                pl_labels = fake_labels[:pl_minibatch_size]
+                G_pl = eval_G(G, pl_latents, pl_labels, return_dlatents=True)
+
+            # Compute |J*y|.
+            pl_noise = tf.random_normal(tf.shape(G_pl.images)) / np.sqrt(np.prod(G.output_shape[2:]))
+            pl_grads = tf.gradients(tf.reduce_sum(G_pl.images * pl_noise), [G_pl.dlatents])[0]
+            pl_lengths = tf.sqrt(tf.reduce_mean(tf.reduce_sum(tf.square(pl_grads), axis=2), axis=1))
+
+            # Track exponential moving average of |J*y|.
+            with tf.control_dependencies(None):
+                pl_mean_var = tf.Variable(name='pl_mean', trainable=False, initial_value=0, dtype=tf.float32)
+            pl_mean = pl_mean_var + pl_decay * (tf.reduce_mean(pl_lengths) - pl_mean_var)
+            pl_update = tf.assign(pl_mean_var, pl_mean)
+
+            # Calculate (|J*y|-a)^2.
+            with tf.control_dependencies([pl_update]):
+                pl_penalty = tf.square(pl_lengths - pl_mean)
+                pl_penalty = report_stat(aug, 'Loss/pl_penalty', pl_penalty)
+
+            # Apply weight.
+            #
+            # Note: The division in pl_noise decreases the weight by num_pixels, and the reduce_mean
+            # in pl_lengths decreases it by num_affine_layers. The effective weight then becomes:
+            #
+            # gamma_pl = pl_weight / num_pixels / num_affine_layers
+            # = 2 / (r^2) / (log2(r) * 2 - 2)
+            # = 1 / (r^2 * (log2(r) - 1))
+            # = ln(2) / (r^2 * (ln(r) - ln(2))
+            #
+            G_reg += tf.tile(pl_penalty, [pl_minibatch_shrink]) * pl_weight
+
+    return report_loss(aug, G_E_loss, D_loss, G_reg, D_reg, E_reg)
+
+
+
 
 def stylegan2(G, D, aug, fake_labels, real_images, real_labels, r1_gamma=10, pl_minibatch_shrink=2, pl_decay=0.01, pl_weight=2, **_kwargs):
     # Evaluate networks for the main loss.
@@ -98,16 +235,17 @@ def stylegan2(G, D, aug, fake_labels, real_images, real_labels, r1_gamma=10, pl_
 
     # Non-saturating logistic loss from "Generative Adversarial Nets".
     with tf.name_scope('Loss_main'):
-        G_loss = tf.nn.softplus(-D_fake.scores) # -log(sigmoid(D_fake.scores)), pylint: disable=invalid-unary-operand-type
-        D_loss = tf.nn.softplus(D_fake.scores) # -log(1 - sigmoid(D_fake.scores))
-        D_loss += tf.nn.softplus(-D_real.scores) # -log(sigmoid(D_real.scores)), pylint: disable=invalid-unary-operand-type
+        G_loss = tf.nn.softplus(-D_fake.output_2) # -log(sigmoid(D_fake.scores)), pylint: disable=invalid-unary-operand-type
+        D_loss = tf.nn.softplus(D_fake.output_2) # -log(1 - sigmoid(D_fake.scores))
+        D_loss += tf.nn.softplus(-D_real.output_2) # -log(sigmoid(D_real.scores)), pylint: disable=invalid-unary-operand-type
         G_reg = 0
         D_reg = 0
 
     # R1 regularizer from "Which Training Methods for GANs do actually Converge?".
+    # https://ai.stackexchange.com/questions/25458/can-someone-explain-r1-regularization-function-in-simple-terms
     if r1_gamma != 0:
         with tf.name_scope('Loss_R1'):
-            r1_grads = tf.gradients(tf.reduce_sum(D_real.scores), [real_images])[0]
+            r1_grads = tf.gradients(tf.reduce_sum(D_real.output_2), [real_images])[0]
             r1_penalty = tf.reduce_sum(tf.square(r1_grads), axis=[1,2,3])
             r1_penalty = report_stat(aug, 'Loss/r1_penalty', r1_penalty)
             D_reg += r1_penalty * (r1_gamma * 0.5)
