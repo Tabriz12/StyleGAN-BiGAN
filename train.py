@@ -66,10 +66,17 @@ def setup_training_options(
     args = dnnlib.EasyDict() # dictionary like data structure, access with dots
     args.G_args = dnnlib.EasyDict(func_name='training.networks.G_main')
     args.D_args = dnnlib.EasyDict(func_name='training.networks.D_main')
-    args.G_opt_args = dnnlib.EasyDict(beta1=0.0, beta2=0.99)
+    args.E_args = dnnlib.EasyDict(func_name='training.networks.Encoder')
+    args.D_H_args = dnnlib.EasyDict(func_name='training.networks.D_H')
+    args.D_J_args = dnnlib.EasyDict(func_name='training.networks.D_J')
+    args.G_E_opt_args = dnnlib.EasyDict(beta1=0.0, beta2=0.99)
     args.D_opt_args = dnnlib.EasyDict(beta1=0.0, beta2=0.99)
-    args.loss_args = dnnlib.EasyDict(func_name='training.loss.stylegan2')
-    args.augment_args = dnnlib.EasyDict(class_name='training.augment.AdaptiveAugment')
+    # args.E_opt_args = dnnlib.EasyDict(beta1=0.0, beta2=0.99) # Tabriz: not sure the use of betas, training_loop.py line 200
+   # args.D_H_opt_args = dnnlib.EasyDict(beta1=0.0, beta2 = 0.99)
+   # args.D_J_opt_args = dnnlib.EasyDict(beta1=0.0, beta2 = 0.99)
+    # args.loss_args = dnnlib.EasyDict(func_name='training.loss.stylegan2') # Tabriz: Need to change
+    args.loss_args = dnnlib.EasyDict(func_name='training.loss.bistylegan')
+    args.augment_args = dnnlib.EasyDict(class_name='training.augment.AdaptiveAugment') # Tabriz: Take a look
 
     # ---------------------------
     # General options: gpus, snap
@@ -184,13 +191,15 @@ def setup_training_options(
         spec.gamma = 0.0002 * (res ** 2) / spec.mb # heuristic formula
         spec.ema = spec.mb * 10 / 32
 
+    # Tabriz: Below lines need edit
+
     args.total_kimg = spec.kimg
     args.minibatch_size = spec.mb
     args.minibatch_gpu = spec.mb // spec.ref_gpus
     args.D_args.mbstd_group_size = spec.mbstd
     args.G_args.fmap_base = args.D_args.fmap_base = int(spec.fmaps * 16384)
     args.G_args.fmap_max = args.D_args.fmap_max = 512
-    args.G_opt_args.learning_rate = args.D_opt_args.learning_rate = spec.lrate
+    args.G_E_opt_args.learning_rate = args.D_opt_args.learning_rate = spec.lrate
     args.loss_args.r1_gamma = spec.gamma
     args.G_smoothing_kimg = spec.ema
     args.G_smoothing_rampup = spec.ramp
@@ -333,7 +342,7 @@ def setup_training_options(
         if gamma is not None:
             raise UserError(f'--cmethod={cmethod} is not compatible with --gamma')
         args.loss_args = dnnlib.EasyDict(func_name='training.loss.wgangp')
-        args.G_opt_args.learning_rate = args.D_opt_args.learning_rate = 0.001
+        args.G_E_opt_args.learning_rate = args.D_opt_args.learning_rate = 0.001
         args.G_args.num_fp16_res = args.D_args.num_fp16_res = 0 # disable mixed-precision training
         args.G_args.conv_clamp = args.D_args.conv_clamp = None
         args.lazy_regularization = False

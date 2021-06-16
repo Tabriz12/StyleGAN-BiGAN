@@ -17,8 +17,8 @@ from dnnlib.tflib.ops.upfirdn_2d import upsample_2d, downsample_2d, upsample_con
 from dnnlib.tflib.ops.fused_bias_act import fused_bias_act
 tf.keras.backend.set_image_data_format("channels_first")
 from tensorflow import keras
-from tensorflow.keras.layers import Conv2D, BatchNormalization, Dropout, Activation, AveragePooling2D, Flatten
-
+from tensorflow.keras.layers import Conv2D, BatchNormalization, Dropout, Activation, AveragePooling2D, Flatten, Dense
+from tensorflow.nn import leaky_relu
 
 # NOTE: Do not import any application-specific modules here!
 # Specify all network parameters as kwargs.
@@ -88,6 +88,23 @@ def conv2d(x, w, up=False, down=False, resample_kernel=None, padding=0):
 def conv2d_layer(x, fmaps, kernel, up=False, down=False, resample_kernel=None, lrmul=1, trainable=True, use_spectral_norm=False):
     w = get_weight([kernel, kernel, x.shape[1].value, fmaps], lrmul=lrmul, trainable=trainable, use_spectral_norm=use_spectral_norm)
     return conv2d(x, tf.cast(w, x.dtype), up=up, down=down, resample_kernel=resample_kernel)
+
+
+def res_dense(X, units = 256, training=True): # dense layer with skip connections
+
+    X_1 = Dense(units)(X)
+    X_1 = Dropout(0.2)(X_1, training=training)
+    X_1 = leaky_relu(X_1)
+
+    X_2 = Dense(units)(X_1)
+    X_2 = Dropout(0.2)(X_2, training=training)
+    X_2 = leaky_relu(X_2)
+
+    skip = Dense(units)(X)
+    skip = leaky_relu(skip)
+
+    return X_2 + skip
+
 
 # ----------------------------------------------------------------------------
 # Modulated 2D convolution layer from the paper
@@ -196,7 +213,7 @@ def G_main(
     # Evaluation mode.
     is_training             = False,                # Network is under training? Enables and disables specific features.
     is_validation           = False,                # Network is under validation? Chooses which value to use for truncation_psi.
-    return_dlatents         = False,             # I NEED THIS ONE   # Return dlatents (W) in addition to the images?
+    return_dlatents         = True,             # I NEED THIS ONE   # Return dlatents (W) in addition to the images?
 
     # Truncation & style mixing.
     truncation_psi          = 0.5,                  # Style strength multiplier for the truncation trick. None = disable.
@@ -462,7 +479,7 @@ def G_synthesis(
 
 
 # ----------------------------------------------------------------------------
-# Encoder.
+# Encoder. Relatively small with respect to gen/disc
 
 def Encoder(
         images_in,
@@ -471,9 +488,10 @@ def Encoder(
         resolution = 32,
         num_channels = 3,
         dtype = 'float32',
-        architecture = 'resnet',
+        latent_size = 512,
+        return_images = False,
+        is_training = True,
         **_kwargs
-
 ):
 
     resolution_log2 = int(np.log2(resolution))
@@ -510,8 +528,11 @@ def Encoder(
 
         return X
 
-    depth = 56
-    num_filters_in = 32
+
+    depth = 101
+    num_filters_in = 32 # Tabriz: Dicriminator starts with 512 filters, I guess 32 is too low.
+                        # Or maybe I should keep it as it is original resnet50
+                        # And intuitively dimension of encoder output should be same with generator input (first or intermediate)
     num_res_block = int((depth - 2) / 9)
 
     # ResNet V2 performs Conv2D on X before spiting into two path
@@ -553,24 +574,92 @@ def Encoder(
             if unit_res_block == 0:
                 # linear projection residual shortcut connection to match
                 # changed dims
+
                 X = residual_block(X=X,
                                    num_filters=num_filters_out,
                                    kernel_size=1,
                                    stride=stride,
                                    activation=None,
                                    bn=False)
-            X = tf.keras.layers.add([X, y])
+            X = tf.keras.layers.add([X, y]) # Tabriz: Adding is done here
         num_filters_in = num_filters_out
 
     X = BatchNormalization()(X)
     X = Activation('relu')(X)
-    X = AveragePooling2D(pool_size=8)(X)
-    y = Flatten()(X)
+    # X = AveragePooling2D(pool_size=8)(X)
+    test = tf.math.reduce_sum(X, axis = [2,3])
+    X = tf.math.reduce_mean(X, axis=[2, 3], keepdims=True)
+    X = Flatten()(X)
+    X = res_dense(X, training=is_training)
+    X = res_dense(X, training=is_training)
+    dlatents = Dense(latent_size)(X)
 
-    return y
+                                # Tabriz: Should I normalize latents?
+    if return_images:
+        return dlatents, images_in
+    else:
+        return dlatents
 
 # ----------------------------------------------------------------------------
 # Discriminator.
+
+# Tabriz: Main discriminator is much bigger than D_H, it should be marginally bigger intuitively
+
+def D_H (
+        latents_in,
+        labels_in,
+        latent_size = 512,
+        label_size = 0,
+        dtype = 'float32',
+        normalize_latents = False,
+        **_kwargs
+):
+    latents_in.set_shape([None, latent_size])
+    labels_in.set_shape([None, label_size])
+    print(latents_in.shape)
+    latents_in = tf.cast(latents_in, dtype)
+    labels_in = tf.cast(labels_in, dtype)
+    x = latents_in
+
+    # Tabriz: If use adaptive discriminator in main D for data augmentation, should I also do it in this network?
+
+    if normalize_latents:
+        with tf.variable_scope('Normalize'):
+            x = normalize_2nd_moment(x)
+    for layer_idx in range(5):
+        with tf.variable_scope(f'MLP_H{layer_idx}'):
+            if layer_idx < 4:
+                x = apply_bias_act(dense_layer(x, 256, use_spectral_norm=True))
+            else:
+                output_1 = x
+                output_2 = Dense(1)(output_1)
+
+    return output_1, output_2
+
+def D_J (input_f,
+         input_h,
+         input_size = 128,
+         **_kwargs
+         ):
+
+    input_f.set_shape([None, input_size])
+    input_h.set_shape([None, input_size])
+
+    # input_f = tf.reshape(input_f, [tf.shape(input_f)[0], -1])
+   # input_h = tf.reshape(input_h, [tf.shape(input_h)[0], -1])
+    x = tf.concat([input_f, input_h], axis=1)
+    x = Flatten()(x)
+
+    for layer_idx in range(4):
+        with tf.variable_scope(f'MLP_J{layer_idx}'):
+            if layer_idx < 3:
+                x = apply_bias_act(dense_layer(x, 64, use_spectral_norm=True))
+            else:
+                x = Dense(1)(x)
+
+    return x
+
+
 
 def D_main(
     images_in,                          # First input: Images [ minibatch, channel, height, width].
@@ -616,7 +705,8 @@ def D_main(
 
     resolution_log2 = int(np.log2(resolution))
     assert resolution == 2**resolution_log2 and resolution >= 4
-    def nf(stage): return np.clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max)
+    def nf(stage):
+        return np.clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max)
     assert architecture in ['orig', 'skip', 'resnet']
     if mapping_fmaps is None:
         mapping_fmaps = nf(0)
@@ -729,24 +819,33 @@ def D_main(
             x = apply_bias_act(adrop(conv2d_layer(x, fmaps=nf(1), kernel=3, trainable=trainable, use_spectral_norm=use_spectral_norm)), act=act, clamp=conv_clamp, trainable=trainable)
         with tf.variable_scope('Dense0'):
             trainable = is_next_layer_trainable()
-            x = apply_bias_act(adrop(dense_layer(x, fmaps=nf(0), trainable=trainable)), act=act, trainable=trainable)
+            # x = apply_bias_act(adrop(dense_layer(x, fmaps=nf(0), trainable=trainable)), act=act, trainable=trainable)
+            x = apply_bias_act(adrop(dense_layer(x, fmaps=256, trainable=trainable)), act=act, trainable=trainable)
 
     # Output layer (always trainable).
     with tf.variable_scope('Output'):
+
+        # shape of x here is (?, 512), already flattened
+
+        output_1 = x
+
         if label_size > 0:
             assert score_max == 1
             x = apply_bias_act(dense_layer(x, fmaps=mapping_fmaps))
             x = tf.reduce_sum(x * labels_in, axis=1, keepdims=True) / np.sqrt(mapping_fmaps)
         else:
-            x = apply_bias_act(dense_layer(x, fmaps=score_max))
+            # x = apply_bias_act(dense_layer(x, fmaps=score_max))
+            output_2 = apply_bias_act(dense_layer(output_1, fmaps=score_max))
         if pagan_signs is not None:
             assert score_max == 1
             x *= pagan_signs
-    scores_out = x[:, :score_size]
+    # scores_out = x[:, :score_size]
+    output_2 = output_2[:, :score_size]
 
     # Output.
-    assert scores_out.dtype == tf.as_dtype(dtype)
-    scores_out = tf.identity(scores_out, name='scores_out')
-    return scores_out
+    assert output_2.dtype == tf.as_dtype(dtype)
+    # scores_out = tf.identity(scores_out, name='scores_out')
+    return output_1, output_2
+    # return output_2
 
 #----------------------------------------------------------------------------
