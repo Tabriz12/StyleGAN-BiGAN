@@ -107,7 +107,6 @@ def eval_D_H(
         labels,
 ):
     r = dnnlib.EasyDict()
-    print("D_H:", type(latents))
     r.args = dnnlib.EasyDict()
     r.args.is_training = True
     r.output_1, r.output_2 = D_H.get_output_for(latents, labels, **r.args)
@@ -120,7 +119,6 @@ def eval_D_J(
         input_h
 ):
     r = dnnlib.EasyDict()
-    print("D_J:", type(input_f))
     r.args = dnnlib.EasyDict()
     r.args.is_training = True
     r.score = D_J.get_output_for(input_f, input_h, **r.args)

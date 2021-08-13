@@ -166,11 +166,11 @@ def training_loop(
 
     print('Exporting sample images...')
 
-#    grid_size, grid_reals, grid_labels = setup_snapshot_image_grid(training_set)
- #   save_image_grid(grid_reals, os.path.join(run_dir, 'reals.png'), drange=[0, 255], grid_size=grid_size)
-   # grid_latents = np.random.randn(np.prod(grid_size), *G.input_shape[1:])
-   # grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=minibatch_gpu)
- #  save_image_grid(grid_fakes, os.path.join(run_dir, 'fakes_init.png'), drange=[-1, 1], grid_size=grid_size)
+    grid_size, grid_reals, grid_labels = setup_snapshot_image_grid(training_set)
+    save_image_grid(grid_reals, os.path.join(run_dir, 'reals.png'), drange=[0, 255], grid_size=grid_size)
+    grid_latents = np.random.randn(np.prod(grid_size), *G.input_shape[1:])
+    grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=minibatch_gpu)
+    save_image_grid(grid_fakes, os.path.join(run_dir, 'fakes_init.png'), drange=[-1, 1], grid_size=grid_size)
 
 
 # Tabriz: no change
@@ -217,13 +217,13 @@ def training_loop(
 
     # Tabriz: Optimizer initiation, add here encoder
 
-    G_opt = tflib.Optimizer(name='TrainG', **G_E_opt_args)
+    G_E_opt = tflib.Optimizer(name='TrainG', **G_E_opt_args) # Adam Optimizer
     D_opt = tflib.Optimizer(name='TrainD', **D_opt_args)
      # Tabriz: Needs hyperparameter optimization
 
 
     # Tabriz: Lazy regularization
-    G_reg_opt = tflib.Optimizer(name='RegG', share=G_opt, **G_E_opt_args)
+    G_reg_opt = tflib.Optimizer(name='RegG', share=G_E_opt, **G_E_opt_args)
     D_reg_opt = tflib.Optimizer(name='RegD', share=D_opt, **D_opt_args)
    # E_reg_opt = tflib.Optimizer(name='RegE', share=E_opt, **E_opt_args)
    # D_J_reg_opt = tflib.Optimizer(name='RegD_J', share = D_J_opt, **D_J_opt_args)
@@ -237,9 +237,6 @@ def training_loop(
     training_set.configure(minibatch_gpu)
     for gpu, (G_gpu, D_gpu, E_gpu, D_H_gpu, D_J_gpu) in enumerate(zip(G_gpus, D_gpus, E_gpus, D_H_gpus, D_J_gpus)):
         with tf.name_scope(f'Train_gpu{gpu}'), tf.device(f'/gpu:{gpu}'):
-            print(gpu)
-            print(G_gpu)
-            print(D_gpu)
             # Fetch training data via temporary variables.
             with tf.name_scope('DataFetch'):
                 real_images_var = tf.Variable(name='images', trainable=False,
@@ -258,8 +255,11 @@ def training_loop(
                                                   real_images=real_images_var, real_labels=real_labels_var, **loss_args)
 
             if lazy_regularization:
+
                 if terms.G_reg is not None: G_reg_opt.register_gradients(tf.reduce_mean(terms.G_reg * G_reg_interval),
                                                                          G_gpu.trainables)
+                """Tabriz: Register the gradients of the given loss function with respect to the given variables.
+                    Intended to be called once per GPU."""
                 if terms.D_reg is not None: D_reg_opt.register_gradients(tf.reduce_mean(terms.D_reg * D_reg_interval),
                                                                          D_gpu.trainables)
                 # Tabriz: I can add here D_J, D_H
@@ -273,7 +273,7 @@ def training_loop(
 
             # assert terms.D_loss == tf.reduce_mean(terms.D_loss)
 
-            G_opt.register_gradients(terms.G_E_loss, OrderedDict(chain(G_gpu.trainables.items(),
+            G_E_opt.register_gradients(terms.G_E_loss, OrderedDict(chain(G_gpu.trainables.items(),
                                                                        E_gpu.trainables.items())))
             # Tabriz: Can be wrong
             # G_opt.register_gradients(tf.reduce_mean(terms.G_E_loss), G_gpu.trainables)
@@ -287,8 +287,10 @@ def training_loop(
             # Tabriz: In repo, G and E updated together
 
     print('Finalizing training ops...')
+
+    # Tabriz: I do not know if I need to add/edit smth here
     data_fetch_op = tf.group(*data_fetch_ops)
-    G_train_op = G_opt.apply_updates()  # Tabriz: Optimizer of generator & encoder is same
+    G_train_op = G_E_opt.apply_updates()  # Tabriz: Optimizer of generator & encoder is same
     D_train_op = D_opt.apply_updates()
     G_reg_op = G_reg_opt.apply_updates(allow_no_op=True)
     D_reg_op = D_reg_opt.apply_updates(allow_no_op=True)
@@ -312,10 +314,10 @@ def training_loop(
         progress_fn(0, total_kimg)
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
-    cur_nimg = 0
+    cur_nimg = 0 # Tabriz: current number of images
     cur_tick = -1
     tick_start_nimg = cur_nimg
-    running_mb_counter = 0
+    running_mb_counter = 0  # Tabriz: Mini batch counter
 
     done = False
     while not done:  # Tabriz: training starts here
@@ -330,13 +332,15 @@ def training_loop(
         for _repeat_idx in range(minibatch_repeats):
             rounds = range(0, minibatch_size, minibatch_gpu * num_gpus)
             run_G_reg = (lazy_regularization and running_mb_counter % G_reg_interval == 0)
+            # Tabriz: For every g_reg interval it becomes True
             run_D_reg = (lazy_regularization and running_mb_counter % D_reg_interval == 0)
             cur_nimg += minibatch_size
             running_mb_counter += 1
 
             # Fast path without gradient accumulation.
             if len(rounds) == 1:
-                tflib.run([G_train_op, data_fetch_op])
+                tflib.run([D_train_op, Gs_update_op], {Gs_beta_in: Gs_beta}) # need to delete it later
+                tflib.run([G_train_op, data_fetch_op]) # Tabriz: image shape was [32, 3, 3, 512, 512] some shit is going on, same with original no worries
                 if run_G_reg:
                     tflib.run(G_reg_op)
                 tflib.run([D_train_op, Gs_update_op], {Gs_beta_in: Gs_beta})
@@ -391,12 +395,12 @@ def training_loop(
                 progress_fn(cur_nimg // 1000, total_kimg)
 
             # Save snapshots.
-            '''
+
             if image_snapshot_ticks is not None and (done or cur_tick % image_snapshot_ticks == 0):
                 grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=minibatch_gpu)
                 save_image_grid(grid_fakes, os.path.join(run_dir, f'fakes{cur_nimg // 1000:06d}.png'), drange=[-1, 1],
                                 grid_size=grid_size)
-            '''
+
             if network_snapshot_ticks is not None and (done or cur_tick % network_snapshot_ticks == 0):
                 pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg // 1000:06d}.pkl')
                 with open(pkl, 'wb') as f:
