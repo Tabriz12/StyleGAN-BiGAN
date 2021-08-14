@@ -158,7 +158,7 @@ def training_loop(
     G.print_layers()
     D.print_layers()
 
-    # E.print_layers()
+    E.print_layers()
     D_H.print_layers()
     D_J.print_layers()
 
@@ -339,7 +339,7 @@ def training_loop(
 
             # Fast path without gradient accumulation.
             if len(rounds) == 1:
-                tflib.run([D_train_op, Gs_update_op], {Gs_beta_in: Gs_beta}) # need to delete it later
+                # tflib.run([D_train_op, Gs_update_op], {Gs_beta_in: Gs_beta}) # need to delete it later
                 tflib.run([G_train_op, data_fetch_op]) # Tabriz: image shape was [32, 3, 3, 512, 512] some shit is going on, same with original no worries
                 if run_G_reg:
                     tflib.run(G_reg_op)
