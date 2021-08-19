@@ -143,16 +143,19 @@ def training_loop(
         D_J = tflib.Network('D_J', input_size = 256,
                             label_size = training_set.label_size, **D_J_args)
 
-
+        # E.print_layers()
 
         # Tabriz: ENCODER DECLARATION
         if resume_pkl is not None:
             print(f'Resuming from "{resume_pkl}"')
             with dnnlib.util.open_url(resume_pkl) as f:
-                rG, rD, rGs = pickle.load(f) # Tabriz: How to load encoder?
+                rG, rD, rGs, rE, rD_H, rD_J = pickle.load(f) # Tabriz: How to load encoder?
             G.copy_vars_from(rG)
             D.copy_vars_from(rD)
             Gs.copy_vars_from(rGs)
+            E.copy_vars_from(rE)
+            D_H.copy_vars_from(rD_H)
+            D_J.copy_vars_from(rD_J)
             # ADD ENCODER HERE
 
     G.print_layers()
@@ -162,14 +165,15 @@ def training_loop(
     D_H.print_layers()
     D_J.print_layers()
 
-
-
+    #physical_devices = tf.config.list_physical_devices('GPU')
+    #print("Num GPUs:", len(physical_devices))
+    print(tf.test.is_gpu_available())
     print('Exporting sample images...')
 
     grid_size, grid_reals, grid_labels = setup_snapshot_image_grid(training_set)
     save_image_grid(grid_reals, os.path.join(run_dir, 'reals.png'), drange=[0, 255], grid_size=grid_size)
     grid_latents = np.random.randn(np.prod(grid_size), *G.input_shape[1:])
-    grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=minibatch_gpu)
+    grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=minibatch_gpu)[0]
     save_image_grid(grid_fakes, os.path.join(run_dir, 'fakes_init.png'), drange=[-1, 1], grid_size=grid_size)
 
 
@@ -395,16 +399,16 @@ def training_loop(
                 progress_fn(cur_nimg // 1000, total_kimg)
 
             # Save snapshots.
-
+            # Tabriz: Need to save also E, D_H, D_J
             if image_snapshot_ticks is not None and (done or cur_tick % image_snapshot_ticks == 0):
-                grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=minibatch_gpu)
+                grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=minibatch_gpu)[0]
                 save_image_grid(grid_fakes, os.path.join(run_dir, f'fakes{cur_nimg // 1000:06d}.png'), drange=[-1, 1],
                                 grid_size=grid_size)
 
             if network_snapshot_ticks is not None and (done or cur_tick % network_snapshot_ticks == 0):
                 pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg // 1000:06d}.pkl')
                 with open(pkl, 'wb') as f:
-                    pickle.dump((G, D, Gs), f)
+                    pickle.dump((G, D, Gs, E, D_H, D_J), f)
                 if len(metrics):
                     print('Evaluating metrics...')
                     for metric in metrics:

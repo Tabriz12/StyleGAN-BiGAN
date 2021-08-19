@@ -587,12 +587,15 @@ def Encoder(
     X = BatchNormalization()(X)
     X = Activation('relu')(X)
     # X = AveragePooling2D(pool_size=8)(X)
-    test = tf.math.reduce_sum(X, axis = [2,3])
+    # test = tf.math.reduce_sum(X, axis = [2,3])
     X = tf.math.reduce_mean(X, axis=[2, 3], keepdims=True)
     X = Flatten()(X)
-    X = res_dense(X, training=is_training)
-    X = res_dense(X, training=is_training)
-    dlatents = Dense(latent_size)(X)
+    with tf.variable_scope(f'Res_Dense_0'):
+        X = res_dense(X, training=is_training)
+    with tf.variable_scope(f'Res_Dense_1'):
+        X = res_dense(X, training=is_training)
+    with tf.variable_scope(f'Last_Dense'):
+        dlatents = Dense(latent_size)(X)
 
                                 # Tabriz: Should I normalize latents?
     if return_images:
